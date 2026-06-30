@@ -1,7 +1,7 @@
 import base64
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Dict, Optional
 
 from fastapi import Body, FastAPI, Header, Query, Request
@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 TOTAL_ORDERS = 44
 RATE_LIMIT = 16
-WINDOW = 10  # seconds
+WINDOW = 10.0
 
 app = FastAPI()
 
@@ -23,13 +23,13 @@ app.add_middleware(
 )
 
 # Fixed catalog
-catalog = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
+CATALOG = [{"id": i} for i in range(1, TOTAL_ORDERS + 1)]
 
-# Idempotency store
+# Idempotency storage
 idempotency_store: Dict[str, Dict[str, Any]] = {}
 
-# Rate limit buckets
-client_buckets = defaultdict(list)
+# Per-client buckets
+client_buckets = defaultdict(deque)
 
 
 def encode_cursor(index: int) -> str:
@@ -47,27 +47,30 @@ def decode_cursor(cursor: Optional[str]) -> int:
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    # Apply rate limiting only to POST /orders
-    if request.method == "POST" and request.url.path == "/orders":
-        client = request.headers.get("X-Client-Id", "anonymous")
-        now = time.time()
+    client = request.headers.get("X-Client-Id", "anonymous")
+    now = time.monotonic()
 
-        bucket = [t for t in client_buckets[client] if now - t < WINDOW]
-        client_buckets[client] = bucket
+    bucket = client_buckets[client]
 
-        if len(bucket) >= RATE_LIMIT:
-            retry_after = max(1, int(WINDOW - (now - bucket[0])))
+    while bucket and (now - bucket[0]) >= WINDOW:
+        bucket.popleft()
 
-            return JSONResponse(
-                status_code=429,
-                headers={"Retry-After": str(retry_after)},
-                content={"detail": "Rate limit exceeded"},
-            )
+    if len(bucket) >= RATE_LIMIT:
+        retry_after = max(1, int(WINDOW - (now - bucket[0])))
 
-        bucket.append(now)
+        return JSONResponse(
+            status_code=429,
+            headers={
+                "Retry-After": str(retry_after)
+            },
+            content={
+                "detail": "Rate limit exceeded"
+            },
+        )
 
-    response = await call_next(request)
-    return response
+    bucket.append(now)
+
+    return await call_next(request)
 
 
 @app.get("/")
@@ -80,7 +83,6 @@ def create_order(
     body: Dict[str, Any] = Body(default_factory=dict),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
-    # Same key → same response
     if idempotency_key in idempotency_store:
         return JSONResponse(
             status_code=200,
@@ -93,6 +95,7 @@ def create_order(
     }
 
     idempotency_store[idempotency_key] = order
+
     return order
 
 
@@ -103,11 +106,19 @@ def list_orders(
 ):
     start = decode_cursor(cursor)
 
-    items = catalog[start:start + limit]
+    if start < 0:
+        start = 0
+
+    if start > TOTAL_ORDERS:
+        start = TOTAL_ORDERS
+
+    end = min(start + limit, TOTAL_ORDERS)
+
+    items = CATALOG[start:end]
 
     next_cursor = None
-    if start + len(items) < TOTAL_ORDERS:
-        next_cursor = encode_cursor(start + len(items))
+    if end < TOTAL_ORDERS:
+        next_cursor = encode_cursor(end)
 
     return {
         "items": items,
